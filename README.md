@@ -1,4 +1,4 @@
-# Lightweight Federated Learning Framework for IoT/IIoT Intrusion Detection
+# Explainable Intrusion Detection in Constrained IoMT Devices Using Lightweight Federated Learning
 
 > **Intelligent Federated Learning with Communication-Efficient Top-K Sparsification for IoMT/IoT Network Intrusion Detection**
 
