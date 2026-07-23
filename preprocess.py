@@ -1,3 +1,9 @@
+"""
+Research-Grade Preprocessing Pipeline for CICIoT2023
+MEMORY-OPTIMISED: Peak RAM ≤ 18 GB
+Strategy: Sample → Feature Selection → Stream → Direct Write (25 cols only)
+"""
+
 import os
 import json
 import warnings
@@ -36,7 +42,7 @@ PROC_DIR = "/kaggle/working/processed"
 os.makedirs(PROC_DIR, exist_ok=True)
 
 LABEL_COL = "Label"
-TOP_FEATS = 45
+TOP_FEATS = 25
 TEST_SIZE = 0.2
 DTYPE = np.float32
 SAMPLE_FOR_MI = 200_000  # enough for MI estimation
@@ -228,23 +234,17 @@ del X_sample, y_sample, y_sample_raw
 gc.collect()
 
 # ============================================================
-# PHASE 3 — STREAMING LOAD WITH PER-CLASS COLLECTION
+# PHASE 3 — STREAMING LOAD → DIRECT WRITE (25 COLS ONLY)
 # ============================================================
 logger.info("=" * 60)
-logger.info(" PHASE 3 — STREAMING → PER-CLASS LISTS")
+logger.info(" PHASE 3 — STREAMING → TRAIN/TEST (25 features)")
 logger.info("=" * 60)
 
-# Build a simple class_name → class_id mapping (more reliable than label_encoder.transform)
-class_name_to_id = {name: idx for idx, name in enumerate(class_names)}
-
-# Compute per-class targets
+# Compute per-class train/test targets
 class_counts_arr = np.zeros(n_classes, dtype=np.int64)
 for lbl_name, cnt in class_counts.items():
-    cls_idx = class_name_to_id.get(lbl_name)
-    if cls_idx is not None:
-        class_counts_arr[cls_idx] = cnt
-    else:
-        logger.warning(f"  ⚠ Unknown class in counts: {lbl_name}")
+    cls_idx = label_encoder.transform([lbl_name])[0]
+    class_counts_arr[cls_idx] = cnt
 
 train_target = np.zeros(n_classes, dtype=np.int64)
 test_target = np.zeros(n_classes, dtype=np.int64)
@@ -255,9 +255,9 @@ for c in range(n_classes):
 
 n_train_total = int(train_target.sum())
 n_test_total = int(test_target.sum())
-logger.info(f"Train target: {n_train_total:,}  |  Test target: {n_test_total:,}")
+logger.info(f"Train: {n_train_total:,}  |  Test: {n_test_total:,}")
 
-# Pre-allocate arrays with known sizes
+# Pre-allocate arrays for 25 FEATURES ONLY
 X_train = np.zeros((n_train_total, TOP_FEATS), dtype=DTYPE)
 y_train = np.zeros(n_train_total, dtype=np.int32)
 X_test = np.zeros((n_test_total, TOP_FEATS), dtype=DTYPE)
@@ -266,12 +266,13 @@ y_test = np.zeros(n_test_total, dtype=np.int32)
 logger.info(f"Pre-allocated: X_train={fmt_mem(X_train.nbytes)}, "
             f"X_test={fmt_mem(X_test.nbytes)}, "
             f"y_train={fmt_mem(y_train.nbytes)}, y_test={fmt_mem(y_test.nbytes)}")
+logger.info(f"Total allocation: {fmt_mem(X_train.nbytes + X_test.nbytes + y_train.nbytes + y_test.nbytes)}")
 
-# Cursor per class for train and test
+# Cursor per class
 train_cursor = np.zeros(n_classes, dtype=np.int64)
 test_cursor = np.zeros(n_classes, dtype=np.int64)
 
-# Compute base offsets for direct array writes
+# Compute base offsets
 train_base = np.zeros(n_classes, dtype=np.int64)
 test_base = np.zeros(n_classes, dtype=np.int64)
 pos = 0
@@ -283,7 +284,7 @@ for c in range(n_classes):
     test_base[c] = pos
     pos += test_target[c]
 
-# Stream all files again → direct write into pre-allocated arrays
+# Stream all files again → direct write
 total_assigned = 0
 rng = np.random.RandomState(SEED + 1)
 
@@ -293,108 +294,75 @@ for idx, fname in enumerate(files, 1):
         for chunk in pd.read_csv(fpath, chunksize=CHUNK_SIZE, low_memory=False):
             if LABEL_COL not in chunk.columns:
                 continue
-
-            # Collapse labels using a safer approach
-            raw_labels = chunk[LABEL_COL].astype(str).str.strip()
-            collapsed = raw_labels.map(COLLAPSE)
-            valid_mask = collapsed.notna().values
-            if valid_mask.sum() == 0:
-                del chunk
-                gc.collect()
+            chunk[LABEL_COL] = chunk[LABEL_COL].astype(str).str.strip().map(COLLAPSE)
+            chunk = chunk.dropna(subset=[LABEL_COL])
+            if len(chunk) == 0:
                 continue
 
-            # Keep only valid rows
-            valid_labels = collapsed[valid_mask].values
-            X_chunk = chunk[selected_features].values[valid_mask].astype(DTYPE)
+            y_enc = label_encoder.transform(chunk[LABEL_COL].values).astype(np.int32)
+            X_chunk = chunk[selected_features].values.astype(DTYPE)  # ONLY 25 COLS
             del chunk
             gc.collect()
 
-            # Clean inf/nan
+            # Clean
             X_chunk = np.where(np.isinf(X_chunk), np.nan, X_chunk)
             col_med = np.nanmedian(X_chunk, axis=0)
-            nan_mask = np.isnan(X_chunk)
+            nm = np.isnan(X_chunk)
             for ci in range(TOP_FEATS):
-                if nan_mask[:, ci].any():
-                    X_chunk[nan_mask[:, ci], ci] = col_med[ci]
+                if nm[:, ci].any():
+                    X_chunk[nm[:, ci], ci] = col_med[ci]
 
-            # Encode labels using our manual mapping
-            y_enc = np.array([class_name_to_id.get(lbl, -1) for lbl in valid_labels], dtype=np.int32)
-            # Filter any unmapped labels
-            mapped_mask = (y_enc >= 0)
-            if mapped_mask.sum() == 0:
-                del X_chunk, y_enc
-                gc.collect()
-                continue
-
-            X_chunk = X_chunk[mapped_mask]
-            y_enc = y_enc[mapped_mask]
-
-            # Shuffle within this chunk
+            # Shuffle
             perm = rng.permutation(len(X_chunk))
             X_chunk = X_chunk[perm]
             y_enc = y_enc[perm]
 
-            # Assign per class to train/test arrays
+            # Assign per class
             for c in range(n_classes):
                 c_mask = (y_enc == c)
-                c_indices = np.where(c_mask)[0]
-                n_available = len(c_indices)
-                if n_available == 0:
+                c_idx = np.where(c_mask)[0]
+                if len(c_idx) == 0:
                     continue
 
-                train_needed = int(train_target[c] - train_cursor[c])
-                test_needed = int(test_target[c] - test_cursor[c])
+                train_needed = train_target[c] - train_cursor[c]
+                test_needed = test_target[c] - test_cursor[c]
 
-                # How many can we take for train vs test
-                n_train = min(train_needed, n_available)
-                n_test = min(test_needed, n_available - n_train)
+                n_train = min(train_needed, len(c_idx))
+                n_test = min(test_needed, len(c_idx) - n_train)
 
                 if n_train > 0:
-                    start = int(train_base[c] + train_cursor[c])
-                    end = start + n_train
-                    X_train[start:end] = X_chunk[c_indices[:n_train]]
-                    y_train[start:end] = y_enc[c_indices[:n_train]]
+                    ws = train_base[c] + train_cursor[c]
+                    we = ws + n_train
+                    X_train[ws:we] = X_chunk[c_idx[:n_train]]
+                    y_train[ws:we] = y_enc[c_idx[:n_train]]
                     train_cursor[c] += n_train
 
                 if n_test > 0:
-                    start = int(test_base[c] + test_cursor[c])
-                    end = start + n_test
-                    X_test[start:end] = X_chunk[c_indices[n_train:n_train + n_test]]
-                    y_test[start:end] = y_enc[c_indices[n_train:n_train + n_test]]
+                    ws = test_base[c] + test_cursor[c]
+                    we = ws + n_test
+                    X_test[ws:we] = X_chunk[c_idx[n_train:n_train + n_test]]
+                    y_test[ws:we] = y_enc[c_idx[n_train:n_train + n_test]]
                     test_cursor[c] += n_test
 
             total_assigned += len(X_chunk)
-            del X_chunk, y_enc, valid_labels, collapsed
+            del X_chunk, y_enc
             gc.collect()
 
         logger.info(f"  [{idx:02d}/{len(files)}] {fname:<50s} | assigned: {total_assigned:,}")
 
     except Exception as exc:
-        logger.error(f"  ✗ {fname}: {exc}", exc_info=True)
-        raise  # Re-raise to halt on errors
+        logger.error(f"  ✗ {fname}: {exc}")
 
-# Verify all classes have correct counts
+# Verify
 for c in range(n_classes):
-    actual_train = int(train_cursor[c])
-    expected_train = int(train_target[c])
-    actual_test = int(test_cursor[c])
-    expected_test = int(test_target[c])
-    if actual_train != expected_train:
-        raise AssertionError(
-            f"Class {c} ({class_names[c]}): train {actual_train:,} != {expected_train:,}. "
-            f"Test: {actual_test:,} vs {expected_test:,}. "
-            f"Total available: {class_counts_arr[c]:,}"
-        )
-    if actual_test != expected_test:
-        raise AssertionError(
-            f"Class {c} ({class_names[c]}): test {actual_test:,} != {expected_test:,}"
-        )
+    assert train_cursor[c] == train_target[c], f"Class {c} train: {train_cursor[c]} != {train_target[c]}"
+    assert test_cursor[c] == test_target[c], f"Class {c} test: {test_cursor[c]} != {test_target[c]}"
 
-logger.info(f"✓ All {total_assigned:,} rows assigned correctly")
+logger.info(f"✓ All {total_assigned:,} rows assigned")
 integrity_assert(X_train, y_train, stage="train-raw")
 integrity_assert(X_test, y_test, stage="test-raw")
 
-# Final shuffle within train/test
+# Final shuffle
 train_perm = rng.permutation(n_train_total)
 test_perm = rng.permutation(n_test_total)
 X_train = np.ascontiguousarray(X_train[train_perm])

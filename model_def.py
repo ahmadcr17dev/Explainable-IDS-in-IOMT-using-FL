@@ -1,3 +1,4 @@
+%%writefile /kaggle/working/model_def.py
 import os, logging
 import numpy as np
 
@@ -17,22 +18,6 @@ except ImportError:
 
 
 def focal_loss(gamma=2.0, alpha=0.25):
-    def loss_fn(y_true, y_pred):
-        y_true = tf.cast(y_true, tf.int32)
-        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0)
-        ce = tf.nn.sparse_softmax_cross_entropy_with_logits(
-            labels=y_true, logits=tf.math.log(y_pred)
-        )
-        pt = tf.exp(-ce)
-        fl = alpha * (1 - pt)**gamma * ce
-        return tf.reduce_mean(fl)
-    return loss_fn
-
-
-def focal_loss_fn(gamma=2.0, alpha=0.25):
-    """Focal loss for multi-class classification.
-    Exported separately so federated_train.py can use it in client training.
-    """
     def loss_fn(y_true, y_pred):
         y_true = tf.cast(y_true, tf.int32)
         y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0)
